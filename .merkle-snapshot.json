@@ -1,0 +1,40 @@
+{
+  "rootHash": "6750a99c2eb43a2ebdded3e408c6026c2b2c865698c3edba4cd78ff38cb3d5aa",
+  "timestamp": 1784010825582,
+  "fileCount": 2,
+  "files": [
+    {
+      "path": "damai_monitor.py",
+      "hash": "a81e5d401ff1dfd49c26e09627a4890718fda0c96f1f9ddfcec148c632577989",
+      "size": 12101,
+      "modified": 1783999167180.3186
+    },
+    {
+      "path": "_probe2.py",
+      "hash": "ead7376c0b4b57b73fef06e415710692a0fd456c1d35f79d7b6437f54a13acba",
+      "size": 1155,
+      "modified": 1783999854424.5251
+    }
+  ],
+  "tree": {
+    "hash": "6750a99c2eb43a2ebdded3e408c6026c2b2c865698c3edba4cd78ff38cb3d5aa",
+    "left": {
+      "hash": "ead7376c0b4b57b73fef06e415710692a0fd456c1d35f79d7b6437f54a13acba",
+      "file": {
+        "path": "_probe2.py",
+        "hash": "ead7376c0b4b57b73fef06e415710692a0fd456c1d35f79d7b6437f54a13acba",
+        "size": 1155,
+        "modified": 1783999854424.5251
+      }
+    },
+    "right": {
+      "hash": "a81e5d401ff1dfd49c26e09627a4890718fda0c96f1f9ddfcec148c632577989",
+      "file": {
+        "path": "damai_monitor.py",
+        "hash": "a81e5d401ff1dfd49c26e09627a4890718fda0c96f1f9ddfcec148c632577989",
+        "size": 12101,
+        "modified": 1783999167180.3186
+      }
+    }
+  }
+}

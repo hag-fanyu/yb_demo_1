@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('damai_monitor.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\"; python damai_monitor.py --help)",
+      "PowerShell($py = \\(Get-Command py -ErrorAction SilentlyContinue\\).Source; if \\($py\\) { & $py -c \"import ast; ast.parse\\(open\\('damai_monitor.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\"; & $py damai_monitor.py --help } else { Write-Output \"python/py not found on PATH\" })",
+      "PowerShell($py = \\(Get-Command python -ErrorAction SilentlyContinue\\).Source; if \\(-not $py\\) { $py = \\(Get-Command py -ErrorAction SilentlyContinue\\).Source }; if \\(-not $py\\) { Write-Output \"NOT FOUND\"; exit }; Write-Output \"interpreter: $py\"; & $py --version; & $py -c \"import ast; ast.parse\\(open\\('damai_monitor.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\"; & $py -c \"import requests; print\\('requests', requests.__version__\\)\")",
+      "PowerShell(py *)",
+      "WebFetch(domain:www.damai.cn)",
+      "PowerShell(Remove-Item *)",
+      "PowerShell(python -c \"import requests; print\\('requests OK, version:', requests.__version__\\)\")"
+    ]
+  }
+}
