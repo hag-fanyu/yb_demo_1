@@ -8,7 +8,20 @@
       "PowerShell(py *)",
       "WebFetch(domain:www.damai.cn)",
       "PowerShell(Remove-Item *)",
-      "PowerShell(python -c \"import requests; print\\('requests OK, version:', requests.__version__\\)\")"
+      "PowerShell(python -c \"import requests; print\\('requests OK, version:', requests.__version__\\)\")",
+      "Bash(adb devices *)",
+      "Bash(where adb *)",
+      "Read(//c/Users/Administrator/AppData/Local/Android/Sdk/platform-tools/**)",
+      "Read(//c/Program Files/**)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(.venv/Scripts/pip.exe install *)",
+      "Bash(python *)",
+      "Bash(where.exe adb *)",
+      "Bash($ADB devices *)",
+      "Bash($ADB shell *)",
+      "Bash(echo \"=== frida-server 文件 ===\")",
+      "Bash(/d/platform-tools/adb.exe shell *)",
+      "Bash(echo \"=== frida-server 版本 ===\")"
     ]
   }
 }

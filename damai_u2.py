@@ -228,6 +228,7 @@ class DamaiU2Automation:
         self.d: Optional[u2.Device] = None
         self._wd = None  # WebDriver (chrome devtools)
         self._native_context: Optional[str] = None
+        self._webview_warned = False  # 是否已提示过 WebView 不可用
         self._webview_context: Optional[str] = None
         self._cookies: List[Dict[str, Any]] = []
 
@@ -303,60 +304,192 @@ class DamaiU2Automation:
     def _find_devtools_port(self) -> Optional[int]:
         """通过 adb 查找设备上 WebView 的 Chrome DevTools 端口。
 
+        核心原理：
+          Android WebView 的 DevTools 监听在 Unix 抽象套接字上，名称形如：
+            @webview_devtools_remote_<pid>       (Android System WebView)
+            @chrome_devtools_remote_<pid>        (Chrome)
+            @devtools_remote_<pid>               (旧版)
+          必须用 adb forward tcp:<local> localabstract:<socket_name> 转发，
+          而非 tcp:<port> → tcp:<port>（设备端没有 TCP 端口监听）。
+
         Returns:
             DevTools 本地转发端口号，或 None
         """
         if not self.d:
             return None
 
-        # 获取设备上所有可调试的 WebView 进程
-        try:
-            output = self.d.shell("cat /proc/net/unix 2>/dev/null | grep devtools")[0]
-            self._log(f"devtools socket 搜索结果：{output[:500] if output else '(空)'}")
-        except Exception:
-            output = ""
+        if not requests:
+            self._warn("缺少 requests 库，无法检测 DevTools 端口")
+            return None
 
-        # 尝试从 /proc/net/unix 中提取 devtools 端口
-        # Chrome DevTools 通常监听在 @chrome_devtools_remote.* 或具体端口
-        ports_to_try = []
-
-        # 方法 1：通过 adb shell 获取 WebView 调试端口
+        # ── 方法 1：从 /proc/net/unix 提取抽象套接字名，正确转发 ──
+        # 这是最可靠的方式
         try:
-            # 查找所有 webview_devtools_remote socket
-            output2 = self.d.shell(
-                "cat /proc/net/unix 2>/dev/null | grep -i webview_devtools"
+            # /proc/net/unix 第 6 列是套接字路径，抽象套接字以 @ 开头
+            # 但在 /proc/net/unix 中 @ 会被显示为空格
+            output = self.d.shell(
+                "cat /proc/net/unix 2>/dev/null"
             )[0]
-            if output2:
-                self._log(f"找到 webview_devtools socket：{output2[:300]}")
-        except Exception:
-            pass
+            if output:
+                # 查找所有 devtools 相关的抽象套接字
+                # 在 /proc/net/unix 中，抽象套接字的路径列以空格开头（@ 被替换为空格）
+                devtools_sockets = []
+                for line in output.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        sock_path = parts[-1]  # 最后一列是路径
+                        # 匹配 devtools 抽象套接字（@ 被显示为前导空格或 @）
+                        if any(kw in sock_path.lower() for kw in
+                               ["devtools_remote", "webview_devtools"]):
+                            # 还原 @ 前缀（抽象套接字在 /proc/net/unix 中 @ 显示为空格）
+                            if sock_path.startswith(" "):
+                                sock_path = "@" + sock_path[1:]
+                            devtools_sockets.append(sock_path)
 
-        # 方法 2：逐个尝试常见端口 (9222 是最常用的)
-        for port in [9222, 9229, 9223, 9224, 9225, 9226]:
+                # 去重
+                devtools_sockets = list(dict.fromkeys(devtools_sockets))
+
+                if devtools_sockets:
+                    self._log(f"找到 {len(devtools_sockets)} 个 devtools 抽象套接字：{devtools_sockets}")
+
+                    # 对每个套接字尝试转发
+                    local_port = 9222
+                    for sock_name in devtools_sockets:
+                        # 去掉 @ 前缀得到 localabstract 的名称
+                        abstract_name = sock_name.lstrip("@")
+                        self._log(f"尝试 adb forward tcp:{local_port} localabstract:{abstract_name}")
+                        try:
+                            # 先移除可能存在的旧转发
+                            try:
+                                self.d.adb.forward_remove(f"tcp:{local_port}")
+                            except Exception:
+                                pass
+                            # 设置正确的转发：本地 TCP → 设备抽象套接字
+                            self.d.adb.forward(f"tcp:{local_port}", f"localabstract:{abstract_name}")
+                            time.sleep(0.5)
+                            # 验证端口可用
+                            resp = requests.get(
+                                f"http://127.0.0.1:{local_port}/json/version",
+                                timeout=3,
+                            )
+                            if resp.status_code == 200:
+                                self._log(f"DevTools 在端口 {local_port} 可用（via localabstract:{abstract_name}）：{resp.json()}")
+                                return local_port
+                            else:
+                                self._log(f"端口 {local_port} 响应非 200：{resp.status_code}")
+                        except Exception as e:
+                            self._log(f"转发 localabstract:{abstract_name} 失败：{e}")
+                        finally:
+                            # 如果失败，移除转发
+                            try:
+                                self.d.adb.forward_remove(f"tcp:{local_port}")
+                            except Exception:
+                                pass
+                        local_port += 1
+                else:
+                    self._log("/proc/net/unix 中未找到 devtools 抽象套接字")
+        except Exception as e:
+            self._log(f"解析 /proc/net/unix 失败：{e}")
+
+        # ── 方法 2：用 adb shell cat /proc/net/unix + grep 精简版 ──
+        # 有些设备 /proc/net/unix 权限受限，用 grep 直接搜
+        try:
+            for pattern in ["webview_devtools", "chrome_devtools", "devtools_remote"]:
+                output = self.d.shell(
+                    f"cat /proc/net/unix 2>/dev/null | grep -i '{pattern}'"
+                )[0]
+                if output:
+                    self._log(f"grep '{pattern}' 结果：{output[:500]}")
+                    # 解析套接字名
+                    for line in output.strip().splitlines():
+                        parts = line.split()
+                        if parts:
+                            sock_path = parts[-1]
+                            abstract_name = sock_path.lstrip("@").lstrip()
+                            if abstract_name and any(kw in abstract_name.lower() for kw in
+                                                      ["devtools_remote", "webview_devtools"]):
+                                self._log(f"尝试转发 localabstract:{abstract_name}")
+                                try:
+                                    try:
+                                        self.d.adb.forward_remove("tcp:9222")
+                                    except Exception:
+                                        pass
+                                    self.d.adb.forward("tcp:9222", f"localabstract:{abstract_name}")
+                                    time.sleep(0.5)
+                                    resp = requests.get(
+                                        "http://127.0.0.1:9222/json/version",
+                                        timeout=3,
+                                    )
+                                    if resp.status_code == 200:
+                                        self._log(f"DevTools 在端口 9222 可用（via localabstract:{abstract_name}）")
+                                        return 9222
+                                except Exception as e:
+                                    self._log(f"转发失败：{e}")
+                                finally:
+                                    try:
+                                        self.d.adb.forward_remove("tcp:9222")
+                                    except Exception:
+                                        pass
+        except Exception as e:
+            self._log(f"方法 2 grep 搜索失败：{e}")
+
+        # ── 方法 3：通过 pidof / ps 找 WebView 进程，构造套接字名 ──
+        try:
+            # 找 WebView 相关进程 PID
+            for proc_name in ["webview", "chrome", "damai"]:
+                pid_out = self.d.shell(
+                    f"pidof {proc_name} 2>/dev/null || "
+                    f"ps 2>/dev/null | grep -i '{proc_name}' | head -5"
+                )[0]
+                if pid_out:
+                    self._log(f"进程 '{proc_name}' 输出：{pid_out[:300]}")
+                    # 提取 PID（数字）
+                    pids = re.findall(r'\b(\d+)\b', pid_out)
+                    for pid in pids[:5]:  # 最多尝试 5 个 PID
+                        for sock_prefix in ["webview_devtools_remote_", "chrome_devtools_remote_"]:
+                            abstract_name = f"{sock_prefix}{pid}"
+                            self._log(f"尝试 localabstract:{abstract_name}")
+                            try:
+                                try:
+                                    self.d.adb.forward_remove("tcp:9222")
+                                except Exception:
+                                    pass
+                                self.d.adb.forward("tcp:9222", f"localabstract:{abstract_name}")
+                                time.sleep(0.5)
+                                resp = requests.get(
+                                    "http://127.0.0.1:9222/json/version",
+                                    timeout=3,
+                                )
+                                if resp.status_code == 200:
+                                    self._log(f"DevTools 在端口 9222 可用（via localabstract:{abstract_name}）")
+                                    return 9222
+                            except Exception:
+                                pass
+                            finally:
+                                try:
+                                    self.d.adb.forward_remove("tcp:9222")
+                                except Exception:
+                                    pass
+        except Exception as e:
+            self._log(f"方法 3 进程搜索失败：{e}")
+
+        # ── 方法 4：直接尝试 tcp:9222 → tcp:9222（某些定制 ROM 可能用 TCP） ──
+        for port in [9222, 9229, 9223]:
             try:
-                # 先设置 adb forward
                 self.d.adb.forward(f"tcp:{port}", f"tcp:{port}")
-                # 检测端口是否可访问
+                time.sleep(0.5)
                 resp = requests.get(
                     f"http://127.0.0.1:{port}/json/version",
                     timeout=2,
                 )
                 if resp.status_code == 200:
-                    self._log(f"DevTools 在端口 {port} 可用：{resp.json()}")
+                    self._log(f"DevTools 在端口 {port} 可用（TCP 直连）")
                     return port
             except Exception:
-                # 移除无效的 forward
                 try:
                     self.d.adb.forward_remove(f"tcp:{port}")
                 except Exception:
                     pass
-
-        # 方法 3：用 adb shell ps 找 WebView 进程，再从 /proc/<pid> 找端口
-        try:
-            ps_out = self.d.shell("ps 2>/dev/null | grep -i webview")[0]
-            self._log(f"WebView 进程：{ps_out[:300] if ps_out else '(无)'}")
-        except Exception:
-            pass
 
         return None
 
@@ -461,21 +594,43 @@ class DamaiU2Automation:
         # 查找 DevTools 端口
         port = self._find_devtools_port()
         if port is None:
-            # 尝试强制设置 adb forward 后再试
-            self._log("自动检测端口失败，尝试手动设置 adb forward…")
+            # 最后的兜底：尝试通过进程 PID 构造套接字名
+            self._log("自动检测端口失败，尝试通过进程 PID 构造套接字名…")
             try:
-                # 获取设备序列号
-                serial = self.d.serial if self.d else ""
-                # 用 adb forward 将设备 9222 端口映射到本地
-                self.d.adb.forward("tcp:9222", "tcp:9222")
-                time.sleep(1)
-                # 检测
-                resp = requests.get("http://127.0.0.1:9222/json/version", timeout=3)
-                if resp.status_code == 200:
-                    port = 9222
-                    self._log("手动设置 adb forward 9222 成功")
+                # 查找大麦 APP 的 WebView 进程
+                ps_out = self.d.shell(
+                    "ps 2>/dev/null | grep -E 'webview|chrome' | head -10"
+                )[0]
+                if ps_out:
+                    self._log(f"WebView/Chrome 进程：\n{ps_out[:500]}")
+                    pids = re.findall(r'\b(\d+)\b', ps_out)
+                    for pid in pids[:5]:
+                        for sock_prefix in ["webview_devtools_remote_", "chrome_devtools_remote_"]:
+                            abstract_name = f"{sock_prefix}{pid}"
+                            try:
+                                try:
+                                    self.d.adb.forward_remove("tcp:9222")
+                                except Exception:
+                                    pass
+                                self.d.adb.forward("tcp:9222", f"localabstract:{abstract_name}")
+                                time.sleep(0.5)
+                                resp = requests.get("http://127.0.0.1:9222/json/version", timeout=3)
+                                if resp.status_code == 200:
+                                    port = 9222
+                                    self._log(f"通过 PID {pid} 构造的 localabstract:{abstract_name} 成功")
+                                    break
+                            except Exception:
+                                pass
+                            finally:
+                                if port is None:
+                                    try:
+                                        self.d.adb.forward_remove("tcp:9222")
+                                    except Exception:
+                                        pass
+                        if port is not None:
+                            break
             except Exception as e:
-                self._log(f"手动 adb forward 失败：{e}")
+                self._log(f"兜底进程搜索失败：{e}")
 
         if port is None:
             print("⚠️ 未找到 WebView DevTools 端口。")
@@ -483,8 +638,11 @@ class DamaiU2Automation:
             print("  1. 确保大麦 APP 已打开并显示了 H5 页面")
             print("  2. 在手机开发者选项中开启「WebView 调试」")
             print("     (设置 → 开发者选项 → WebView 实现 → 选择含 'Debug' 的版本)")
-            print("  3. 手动执行：adb forward tcp:9222 tcp:9222")
-            print("  4. 重启 APP 后重试")
+            print("  3. 确认手机已开启「USB 调试」和「USB 调试（安全设置）」")
+            print("  4. 手动执行：")
+            print("     adb shell cat /proc/net/unix | grep devtools   # 查看套接字名")
+            print("     adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>")
+            print("  5. 重启 APP 后重试")
             return False
 
         # 通过 CDP 连接
@@ -540,15 +698,25 @@ class DamaiU2Automation:
             self.switch_to_native()
             time.sleep(1)
 
-            # 点击底部「我的」tab
+            # 点击底部「我的」tab（多种匹配方式）
             my_tab = self.d(text="我的")
-            if my_tab.exists(timeout=5):
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(textContains="我的")
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(description="我的")
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
+            if my_tab.exists(timeout=3):
                 my_tab.click()
                 self._log("已点击「我的」tab")
                 time.sleep(2)
 
-                # 查找登录/注册按钮
+                # 查找登录/注册按钮（多种匹配方式）
                 login_btn = self.d(textContains="登录")
+                if not login_btn.exists(timeout=3):
+                    login_btn = self.d(textContains="登录/注册")
+                if not login_btn.exists(timeout=3):
+                    login_btn = self.d(textContains="Login")
                 if login_btn.exists(timeout=3):
                     login_btn.click()
                     self._log("已点击登录按钮")
@@ -556,10 +724,18 @@ class DamaiU2Automation:
                     return True
 
                 # 查找头像（未登录时点击头像进入登录）
-                avatar = self.d(resourceIdMatches=".*avatar.*|.*user.*icon.*")
+                avatar = self.d(resourceIdMatches=".*avatar.*|.*user.*icon.*|.*head.*img.*")
                 if avatar.exists(timeout=3):
                     avatar.click()
                     self._log("已点击头像进入登录")
+                    time.sleep(2)
+                    return True
+
+                # 查找「登录/注册」文字（可能直接是可点击文字）
+                login_text = self.d(text="登录/注册")
+                if login_text.exists(timeout=3):
+                    login_text.click()
+                    self._log("已点击「登录/注册」文字")
                     time.sleep(2)
                     return True
 
@@ -1068,18 +1244,43 @@ class DamaiU2Automation:
     def _ensure_webview_connected(self) -> bool:
         """确保 WebView 已连接，若未连接则自动尝试切换。
 
+        在非 root 设备上，如果 WebView 调试未开启，会静默降级为纯 Native 模式。
+        只在首次失败时输出提示，后续静默返回。
+
         Returns:
             是否已连接 WebView（self._wd 非 None）
         """
         if self._wd is not None:
             return True
 
+        # 已提示过且已知不可用，静默返回
+        if self._webview_warned:
+            return False
+
         print("  ⚡ _wd 为 None，尝试自动连接 WebView…")
+
+        # 先输出诊断信息
+        try:
+            unix_out = self.d.shell(
+                "cat /proc/net/unix 2>/dev/null | grep -i devtools"
+            )[0]
+            if unix_out:
+                print(f"  📋 设备 devtools 套接字：")
+                for line in unix_out.strip().splitlines()[:10]:
+                    print(f"     {line.strip()}")
+            else:
+                print("  ⚠️ 设备上未找到任何 devtools 套接字")
+                print("     原因：APP 未调用 WebView.setWebContentsDebuggingEnabled(true)")
+                print("     将降级为纯 Native 层操作模式（功能可能受限）")
+        except Exception as e:
+            self._log(f"诊断信息获取失败：{e}")
+
         if self.switch_to_webview():
             print(f"  ✅ 已自动连接 WebView（上下文：{self._webview_context}）")
             return True
         else:
-            self._warn("自动连接 WebView 失败，_wd 仍为 None")
+            self._webview_warned = True
+            self._log("WebView 连接失败，后续将使用纯 Native 模式")
             return False
 
     def _dump_webview_debug_info(self) -> None:

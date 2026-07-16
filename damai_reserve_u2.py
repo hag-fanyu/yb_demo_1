@@ -14,7 +14,7 @@
 
 使用：
   python damai_reserve_u2.py                                    # 交互式
-  python damai_reserve_u2.py --phone 15757176315               # 指定手机号
+  python damai_reserve_u2.py --phone 1********5               # 指定手机号
   python damai_reserve_u2.py --device abc123                   # 指定设备序列号
   python damai_reserve_u2.py --skip-login                      # 跳过登录（使用已保存的 cookies）
   python damai_reserve_u2.py --verbose                          # 详细日志
@@ -32,7 +32,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from damai_u2 import DamaiU2Automation
+from damai_u2 import DamaiU2Automation, DAMAI_PACKAGE
 
 
 # ─── 常量 ────────────────────────────────────────────────────────────────
@@ -66,21 +66,20 @@ class DamaiReserveAutomation(DamaiU2Automation):
             self.switch_to_native()
             time.sleep(1)
 
-            # 点击底部「我的」tab
+            # 点击底部「我的」tab（多种匹配方式）
             my_tab = self.d(text="我的")
-            if my_tab.exists(timeout=5):
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(textContains="我的")
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(description="我的")
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
+            if my_tab.exists(timeout=3):
                 my_tab.click()
                 self._log("已点击「我的」tab")
                 time.sleep(2)
             else:
-                # 备用：通过 resourceId 查找
-                my_tab2 = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
-                if my_tab2.exists(timeout=3):
-                    my_tab2.click()
-                    self._log("已点击「我的」tab（备用方式）")
-                    time.sleep(2)
-                else:
-                    self._warn("未找到「我的」tab")
+                self._warn("未找到「我的」tab")
 
             # 检测已登录标志
             # 标志 1：用户昵称（通常在「我的」页面顶部显示）
@@ -334,18 +333,18 @@ class DamaiReserveAutomation(DamaiU2Automation):
             self.switch_to_native()
             time.sleep(1)
 
-            # 确保在「我的」页面
+            # 确保在「我的」页面（多种匹配方式）
             my_tab = self.d(text="我的")
-            if my_tab.exists(timeout=5):
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(textContains="我的")
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(description="我的")
+            if not my_tab.exists(timeout=3):
+                my_tab = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
+            if my_tab.exists(timeout=3):
                 my_tab.click()
                 self._log("已点击「我的」tab")
                 time.sleep(2)
-            else:
-                my_tab2 = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
-                if my_tab2.exists(timeout=3):
-                    my_tab2.click()
-                    self._log("已点击「我的」tab（备用方式）")
-                    time.sleep(2)
 
             # 查找「抢票预约」入口
             # 策略 1：精确匹配
@@ -389,7 +388,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
             # 策略 5：尝试滚动页面查找
             self._log("尝试滚动查找「抢票预约」…")
             for _ in range(5):
-                self.d.swipe_up(0.5)
+                self.d.swipe(0.5, 0.8, 0.5, 0.2)
                 time.sleep(1)
                 reserve_entry = self.d(textContains="预约")
                 if reserve_entry.exists(timeout=2):
@@ -600,7 +599,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
             # 滚动到页面底部查找
             self._log("滚动到页面底部查找…")
             for _ in range(8):
-                self.d.swipe_up(0.5)
+                self.d.swipe(0.5, 0.8, 0.5, 0.2)
                 time.sleep(0.5)
                 reserved_btn = self.d(textContains="已预约")
                 if reserved_btn.exists(timeout=2):
@@ -963,6 +962,8 @@ def main() -> None:
                         help=f"Cookie 保存文件（默认 {DEFAULT_COOKIE_FILE}）")
     parser.add_argument("--skip-login", action="store_true",
                         help="跳过登录（使用已保存的 cookies）")
+    parser.add_argument("--frida", action="store_true",
+                        help="使用 Frida 注入开启 WebView 调试（需 root + frida-server）")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="输出详细日志")
     args = parser.parse_args()
@@ -976,6 +977,26 @@ def main() -> None:
     print("║  登录 → 抢票预约 → 场次票档                    ║")
     print("╚════════════════════════════════════════════════╝")
     print()
+
+    # ── Step -1: Frida 注入（可选，开启 WebView 调试） ────────────────
+    frida_hook = None
+    if args.frida:
+        try:
+            from frida_webview_debug import FridaWebViewDebugHook
+            print("💉 正在通过 Frida 注入 WebView 调试 hook…")
+            frida_hook = FridaWebViewDebugHook(verbose=verbose)
+            # attach 模式：APP 可能已启动
+            if not frida_hook.attach(DAMAI_PACKAGE):
+                print("⚠️ Frida attach 失败，将尝试继续（WebView 可能无法连接）")
+            else:
+                print("✅ Frida hook 已注入，WebView 调试已开启")
+                time.sleep(2)  # 等待 hook 生效
+        except ImportError:
+            print("⚠️ 未安装 frida，跳过 Frida 注入。")
+            print("  安装方法：pip install frida frida-tools")
+        except Exception as e:
+            print(f"⚠️ Frida 注入失败：{e}")
+            print("  将尝试继续，但 WebView 可能无法连接。")
 
     # ── Step 0: 连接设备 ─────────────────────────────────────────────
     automation = DamaiReserveAutomation(
@@ -1064,6 +1085,9 @@ def main() -> None:
 
     # ── 清理 ─────────────────────────────────────────────────────────
     automation.cleanup()
+    if frida_hook and frida_hook.is_attached():
+        frida_hook.detach()
+        print("✅ Frida hook 已断开")
     print()
 
 
