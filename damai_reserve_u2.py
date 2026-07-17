@@ -28,11 +28,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional, Tuple
 
 from damai_u2 import DamaiU2Automation, DAMAI_PACKAGE
+
+try:
+    from damai_ocr_click import OcrClickHelper
+except ImportError:
+    OcrClickHelper = None  # type: ignore
 
 
 # ─── 常量 ────────────────────────────────────────────────────────────────
@@ -679,6 +686,71 @@ class DamaiReserveAutomation(DamaiU2Automation):
         print("  3. 可能需要手动滚动到页面底部")
         return False
 
+    # ── OCR 降级：点击「已预约」按钮 ─────────────────────────────────
+    def click_reserved_button_ocr(self) -> bool:
+        """OCR 方式点击底部「已预约」按钮（WebView/Native 失败时的降级方案）。
+
+        通过截图 → OCR 识别文字 → adb input tap 点击坐标，
+        不依赖 UI 元素树，适用于自研渲染引擎/Flutter 等场景。
+
+        Returns:
+            是否成功点击
+        """
+        if OcrClickHelper is None:
+            self._warn("damai_ocr_click 模块不可用，无法使用 OCR 降级方案")
+            print("  安装方法：pip install Pillow paddleocr paddlepaddle")
+            return False
+
+        print("📌 [OCR 降级] 正在通过截图+OCR 查找「已预约」按钮…")
+
+        try:
+            helper = OcrClickHelper(device=self.d, verbose=self.verbose)
+            return helper.click_reserved_button()
+        except Exception as e:
+            self._warn(f"OCR 点击「已预约」失败：{e}")
+            return False
+
+    # ── OCR 降级：提取场次和票档信息 ─────────────────────────────────
+    def extract_sessions_and_tickets_ocr(self) -> Dict[str, Any]:
+        """OCR 方式提取场次和票档信息（WebView/Native 失败时的降级方案）。
+
+        通过滚动页面 → 逐屏截图 OCR → 按关键词分类，
+        不依赖 UI 元素树。
+
+        Returns:
+            dict with keys: sessions, tickets, raw_text
+        """
+        if OcrClickHelper is None:
+            self._warn("damai_ocr_click 模块不可用，无法使用 OCR 降级方案")
+            print("  安装方法：pip install Pillow paddleocr paddlepaddle")
+            return {"sessions": [], "tickets": [], "raw_text": ""}
+
+        print("📊 [OCR 降级] 正在通过截图+OCR 提取场次和票档信息…")
+
+        try:
+            helper = OcrClickHelper(device=self.d, verbose=self.verbose)
+            return helper.extract_sessions_and_tickets()
+        except Exception as e:
+            self._warn(f"OCR 提取场次票档失败：{e}")
+            return {"sessions": [], "tickets": [], "raw_text": ""}
+
+    # ── OCR 调试：截图+OCR+标注 ──────────────────────────────────────
+    def debug_ocr_dump(self, save_dir: str = ".") -> None:
+        """调试：截图 + OCR + 标注保存到文件。
+
+        Args:
+            save_dir: 保存目录
+        """
+        if OcrClickHelper is None:
+            self._warn("damai_ocr_click 模块不可用")
+            return
+
+        try:
+            helper = OcrClickHelper(device=self.d, verbose=self.verbose)
+            helper.debug_dump(save_dir=save_dir)
+        except Exception as e:
+            self._warn(f"OCR 调试转储失败：{e}")
+
     # ── 提取场次和票档信息 ────────────────────────────────────────────
     def extract_sessions_and_tickets(self) -> Dict[str, Any]:
         """提取场次和票档信息。
@@ -964,6 +1036,10 @@ def main() -> None:
                         help="跳过登录（使用已保存的 cookies）")
     parser.add_argument("--frida", action="store_true",
                         help="使用 Frida 注入开启 WebView 调试（需 root + frida-server）")
+    parser.add_argument("--ocr", action="store_true",
+                        help="优先使用 OCR+坐标点击方式（截图→OCR→tap），不依赖 UI 元素树")
+    parser.add_argument("--ocr-only", action="store_true",
+                        help="仅使用 OCR 方式，跳过 Native/WebView 尝试")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="输出详细日志")
     args = parser.parse_args()
@@ -1071,13 +1147,42 @@ def main() -> None:
 
     # ── Step 5: 点击「已预约」查看场次和票档 ─────────────────────────
     print()
-    if not automation.click_reserved_button():
+    clicked = False
+
+    if args.ocr_only:
+        # 仅 OCR 模式
+        clicked = automation.click_reserved_button_ocr()
+    elif args.ocr:
+        # OCR 优先模式
+        clicked = automation.click_reserved_button_ocr()
+        if not clicked:
+            print("  OCR 未找到，尝试 Native/WebView 方式…")
+            clicked = automation.click_reserved_button()
+    else:
+        # 默认：Native/WebView 优先，失败降级 OCR
+        clicked = automation.click_reserved_button()
+        if not clicked:
+            print("\n⚠️ Native/WebView 方式未找到「已预约」按钮，尝试 OCR 降级方案…")
+            clicked = automation.click_reserved_button_ocr()
+
+    if not clicked:
         print("\n❌ 无法点击「已预约」按钮。")
         print("将尝试提取当前页面信息…")
 
     # 提取场次和票档信息
     time.sleep(2)  # 等待页面加载
     info = automation.extract_sessions_and_tickets()
+
+    # 如果结构化信息为空，尝试 OCR 降级提取
+    if not info.get("sessions") and not info.get("tickets"):
+        print("\n⚠️ Native/WebView 提取为空，尝试 OCR 降级提取…")
+        ocr_info = automation.extract_sessions_and_tickets_ocr()
+        if ocr_info.get("sessions") or ocr_info.get("tickets"):
+            info = ocr_info
+        elif ocr_info.get("raw_text"):
+            # OCR 提取到了原始文本但没有分类成功，合并 raw_text
+            if not info.get("raw_text"):
+                info["raw_text"] = ocr_info["raw_text"]
 
     # 输出结果
     print()
