@@ -29,6 +29,19 @@ except ImportError:
     )
     sys.exit(1)
 
+from human_sim import (
+    HumanBehaviorConfig,
+    human_browse,
+    human_click,
+    human_delay,
+    human_idle_swipe,
+    human_navigate_pause,
+    human_scroll,
+    human_type_text,
+    human_warmup,
+    set_default_config,
+)
+
 try:
     import requests
 except ImportError:
@@ -217,20 +230,26 @@ class CDPWebView:
 class DamaiU2Automation:
     """大麦网 uiautomator2 自动化（APP 内 WebView）。"""
 
-    def __init__(self, device_serial: Optional[str] = None, verbose: bool = False):
+    def __init__(self, device_serial: Optional[str] = None, verbose: bool = False,
+                 stealth_level: str = "medium"):
         """
         Args:
             device_serial: 设备序列号，None 则自动检测
             verbose: 是否输出详细日志
+            stealth_level: 拟人化等级 "low" / "medium" / "high"
         """
         self.device_serial = device_serial
         self.verbose = verbose
+        self.stealth_level = stealth_level
+        self._human_cfg = HumanBehaviorConfig(stealth_level)
+        set_default_config(self._human_cfg)
         self.d: Optional[u2.Device] = None
         self._wd = None  # WebDriver (chrome devtools)
         self._native_context: Optional[str] = None
         self._webview_warned = False  # 是否已提示过 WebView 不可用
         self._webview_context: Optional[str] = None
         self._cookies: List[Dict[str, Any]] = []
+        self._has_root: Optional[bool] = None  # 设备 root 状态缓存（None=未检测）
 
     # ── 日志 ──────────────────────────────────────────────────────────
     def _log(self, msg: str) -> None:
@@ -266,11 +285,160 @@ class DamaiU2Automation:
         self._log(f"设备信息：{device_info}")
 
         # 初始化 ATX agent
+        # 注意：set_fastinput_ime(True) 会切换到 ATX 输入法，
+        # 这是自动化检测的重要指纹！风控系统可以通过 InputMethodManager
+        # 检测到非标准输入法。仅在 low 隐身级别下启用。
         self._log("初始化 ATX agent…")
+        if self._human_cfg.level == "low":
+            try:
+                self.d.set_fastinput_ime(True)
+            except Exception as e:
+                self._warn(f"设置输入法失败（非致命）：{e}")
+        else:
+            self._log("跳过 set_fastinput_ime（避免输入法指纹）")
+
+        # 降低 ATX agent 指纹可见性
+        self._hide_atx_fingerprint()
+
+    # ── ATX 指纹隐藏 ──────────────────────────────────────────────────
+    def _hide_atx_fingerprint(self) -> None:
+        """尽量降低 ATX agent 指纹可见性。
+
+        uiautomator2 会在设备上安装 ATX Agent（com.github.uiautomator），
+        这是风控系统检测自动化的头号指纹：
+          - /data/local/tmp/atx-agent 进程持续运行
+          - com.github.uiautomator APK 安装记录
+          - ATX 输入法切换到非标准输入法
+        此方法在保留 u2 连接功能的前提下，尽量降低这些指纹的可见性。
+        """
+        if not self.d:
+            return
+
+        self._log("正在降低 ATX agent 指纹可见性…")
+
+        # 1. 确保输入法切回系统默认（不使用 ATX IME）
+        #    ATX 输入法是风控检测的重要特征：InputMethodManager 中出现非标准输入法
         try:
-            self.d.set_fastinput_ime(True)
+            # 获取当前输入法
+            cur_ime = self.d.shell("settings get secure default_input_method 2>/dev/null")[0].strip()
+            if "uiautomator" in cur_ime.lower() or "atx" in cur_ime.lower():
+                self._log(f"当前输入法为 ATX IME：{cur_ime}，切回系统默认")
+                self.d.shell(
+                    "settings put secure default_input_method "
+                    "com.android.inputmethod.latin/.LatinIME 2>/dev/null"
+                )
+                # 也尝试其他常见系统输入法
+                for ime in [
+                    "com.sohu.inputmethod.sogou/.SogouIME",          # 搜狗
+                    "com.iflytek.inputmethod/.FlyIME",               # 讯飞
+                    "com.baidu.input/.ImeService",                   # 百度
+                ]:
+                    try:
+                        # 检查输入法是否安装
+                        check = self.d.shell(f"pm list packages | grep '{ime.split('/')[0].split('.')[-1]}'")[0]
+                        if check.strip():
+                            self.d.shell(f"settings put secure default_input_method {ime} 2>/dev/null")
+                            self._log(f"切换到已安装输入法：{ime}")
+                            break
+                    except Exception:
+                        continue
+            else:
+                self._log(f"当前输入法非 ATX：{cur_ime}，无需切换")
         except Exception as e:
-            self._warn(f"设置输入法失败（非致命）：{e}")
+            self._log(f"输入法切换失败（非致命）：{e}")
+
+        # 2. 停止 ATX agent 的 UI 界面（保留后台 HTTP 服务，u2 连接需要）
+        try:
+            self.d.shell("am force-stop com.github.uiautomator 2>/dev/null")
+            self._log("已 force-stop com.github.uiautomator（UI 界面）")
+        except Exception as e:
+            self._log(f"force-stop ATX 失败（非致命）：{e}")
+
+        # 3. 如果隐身级别 >= medium，尝试隐藏 ATX APK 的 launcher activity
+        #    这样 ATX 不会出现在最近任务列表中
+        if self._human_cfg.level in ("medium", "high"):
+            try:
+                self.d.shell(
+                    "pm disable com.github.uiautomator/.MainActivity 2>/dev/null"
+                )
+                self._log("已 disable ATX launcher activity")
+            except Exception as e:
+                self._log(f"disable ATX activity 失败（需 root）：{e}")
+
+    # ── Root 检测 ──────────────────────────────────────────────────────
+    def check_root(self) -> bool:
+        """检测设备是否已 root。
+
+        策略（由快到慢，任一成功即返回 True）：
+          1. `su -c id` → 返回 uid=0(root)
+          2. `which su` → su 二进制存在
+          3. 检查 /system/xbin/su 或 /sbin/su 是否存在
+          4. 检查 Build.TAGS 是否含 "test-keys"
+
+        Returns:
+            是否已 root
+        """
+        # 使用缓存
+        if self._has_root is not None:
+            return self._has_root
+
+        if not self.d:
+            self._has_root = False
+            return False
+
+        print("🔍 正在检测设备 root 状态…")
+
+        # 策略 1：su -c id
+        try:
+            output = self.d.shell("su -c id 2>/dev/null")[0]
+            if "uid=0" in output or "root" in output:
+                self._log("su -c id → root 权限确认")
+                print("✅ 设备已 root（su 可用）")
+                self._has_root = True
+                return True
+        except Exception as e:
+            self._log(f"su -c id 失败：{e}")
+
+        # 策略 2：which su
+        try:
+            output = self.d.shell("which su 2>/dev/null")[0].strip()
+            if output and "not found" not in output:
+                self._log(f"which su → {output}")
+                print("✅ 设备已 root（su 二进制存在）")
+                self._has_root = True
+                return True
+        except Exception as e:
+            self._log(f"which su 失败：{e}")
+
+        # 策略 3：检查常见 su 路径
+        su_paths = ["/system/xbin/su", "/sbin/su", "/system/bin/su",
+                     "/vendor/bin/su", "/su/bin/su"]
+        for path in su_paths:
+            try:
+                output = self.d.shell(f"ls -l {path} 2>/dev/null")[0].strip()
+                if output and "No such file" not in output:
+                    self._log(f"找到 su：{output}")
+                    print(f"✅ 设备已 root（su 位于 {path}）")
+                    self._has_root = True
+                    return True
+            except Exception:
+                continue
+
+        # 策略 4：Build.TAGS 含 test-keys
+        try:
+            output = self.d.shell("getprop ro.build.tags 2>/dev/null")[0].strip()
+            if "test-keys" in output:
+                self._log("Build.TAGS 含 test-keys")
+                print("✅ 设备已 root（test-keys build）")
+                self._has_root = True
+                return True
+        except Exception as e:
+            self._log(f"getprop ro.build.tags 失败：{e}")
+
+        # 所有策略均未检测到 root
+        print("⚠️ 设备未 root（Frida/注入类方案不可用，将使用 Intent/OCR/Native 方案）")
+        self._has_root = False
+        return False
 
     # ── APP 启动 ──────────────────────────────────────────────────────
     def launch_damai_app(self) -> None:
@@ -278,15 +446,18 @@ class DamaiU2Automation:
         print("🚀 正在启动大麦 APP…")
         try:
             self.d.app_start(DAMAI_PACKAGE, DAMAI_ACTIVITY, wait=True)
-            time.sleep(3)  # 等待 APP 启动
+            human_delay(3.0, config=self._human_cfg)  # 等待 APP 启动
             self._log("大麦 APP 已启动")
+            # 预热行为：模拟用户刚打开 APP 的浏览
+            human_warmup(self.d, config=self._human_cfg)
         except Exception as e:
             self._warn(f"启动大麦 APP 失败：{e}")
             # 尝试只用包名启动
             try:
                 self.d.app_start(DAMAI_PACKAGE, wait=True)
-                time.sleep(3)
+                human_delay(3.0, config=self._human_cfg)
                 self._log("大麦 APP 已启动（备用方式）")
+                human_warmup(self.d, config=self._human_cfg)
             except Exception as e2:
                 print(f"❌ 无法启动大麦 APP：{e2}")
                 print("请确认已安装大麦 APP（包名：cn.damai）")
@@ -667,7 +838,7 @@ class DamaiU2Automation:
         try:
             self._wd.get(url)
             self._log(f"已导航到：{url}")
-            time.sleep(2)
+            human_delay(2.0, config=self._human_cfg)
         except Exception as e:
             self._warn(f"导航失败：{e}")
 
@@ -696,7 +867,7 @@ class DamaiU2Automation:
         # 策略 1：在 native 层操作
         try:
             self.switch_to_native()
-            time.sleep(1)
+            human_delay(1.0, config=self._human_cfg)
 
             # 点击底部「我的」tab（多种匹配方式）
             my_tab = self.d(text="我的")
@@ -707,9 +878,9 @@ class DamaiU2Automation:
             if not my_tab.exists(timeout=3):
                 my_tab = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
             if my_tab.exists(timeout=3):
-                my_tab.click()
+                human_click(my_tab, config=self._human_cfg)
                 self._log("已点击「我的」tab")
-                time.sleep(2)
+                human_delay(2.0, config=self._human_cfg)
 
                 # 查找登录/注册按钮（多种匹配方式）
                 login_btn = self.d(textContains="登录")
@@ -718,25 +889,25 @@ class DamaiU2Automation:
                 if not login_btn.exists(timeout=3):
                     login_btn = self.d(textContains="Login")
                 if login_btn.exists(timeout=3):
-                    login_btn.click()
+                    human_click(login_btn, config=self._human_cfg)
                     self._log("已点击登录按钮")
-                    time.sleep(2)
+                    human_delay(2.0, config=self._human_cfg)
                     return True
 
                 # 查找头像（未登录时点击头像进入登录）
                 avatar = self.d(resourceIdMatches=".*avatar.*|.*user.*icon.*|.*head.*img.*")
                 if avatar.exists(timeout=3):
-                    avatar.click()
+                    human_click(avatar, config=self._human_cfg)
                     self._log("已点击头像进入登录")
-                    time.sleep(2)
+                    human_delay(2.0, config=self._human_cfg)
                     return True
 
                 # 查找「登录/注册」文字（可能直接是可点击文字）
                 login_text = self.d(text="登录/注册")
                 if login_text.exists(timeout=3):
-                    login_text.click()
+                    human_click(login_text, config=self._human_cfg)
                     self._log("已点击「登录/注册」文字")
-                    time.sleep(2)
+                    human_delay(2.0, config=self._human_cfg)
                     return True
 
         except Exception as e:
@@ -746,7 +917,7 @@ class DamaiU2Automation:
         print("  尝试通过 H5 页面登录…")
         if self.switch_to_webview():
             self.navigate_to_url(H5_LOGIN_URL)
-            time.sleep(3)
+            human_delay(3.0, config=self._human_cfg)
             current = self.get_current_url()
             if "passport" in current or "login" in current:
                 print("✅ 已到达登录页面")
@@ -756,7 +927,7 @@ class DamaiU2Automation:
         return False
 
     def input_phone(self, phone: str) -> bool:
-        """在登录页输入手机号。
+        """在登录页输入手机号（拟人化逐字输入）。
 
         Args:
             phone: 手机号码
@@ -783,7 +954,7 @@ class DamaiU2Automation:
             except Exception as e:
                 self._log(f"WebView 输入手机号失败：{e}")
 
-        # 备用：Native 层输入
+        # 备用：Native 层输入（拟人化逐字输入）
         try:
             self.switch_to_native()
             # 查找手机号输入框
@@ -791,15 +962,15 @@ class DamaiU2Automation:
                 resourceIdMatches=".*phone.*|.*mobile.*|.*account.*"
             )
             if phone_field.exists(timeout=3):
-                phone_field.set_text(phone)
-                self._log("已通过 Native 输入手机号")
+                human_type_text(self.d, phone_field, phone, config=self._human_cfg)
+                self._log("已通过 Native 逐字输入手机号")
                 return True
 
             # 通过 className 查找 EditText
             edit_fields = self.d(className="android.widget.EditText")
             if edit_fields.exists(timeout=3):
-                edit_fields.set_text(phone)
-                self._log("已通过 EditText 输入手机号")
+                human_type_text(self.d, edit_fields, phone, config=self._human_cfg)
+                self._log("已通过 EditText 逐字输入手机号")
                 return True
 
         except Exception as e:
@@ -850,19 +1021,19 @@ class DamaiU2Automation:
             self.switch_to_native()
             send_btn = self.d(textContains="获取验证码")
             if send_btn.exists(timeout=3):
-                send_btn.click()
+                human_click(send_btn, config=self._human_cfg)
                 self._log("已通过 Native 点击发送验证码")
                 return True
 
             send_btn = self.d(textContains="发送验证码")
             if send_btn.exists(timeout=3):
-                send_btn.click()
+                human_click(send_btn, config=self._human_cfg)
                 self._log("已通过 Native 点击发送验证码")
                 return True
 
             send_btn = self.d(textContains="获取短信")
             if send_btn.exists(timeout=3):
-                send_btn.click()
+                human_click(send_btn, config=self._human_cfg)
                 self._log("已通过 Native 点击发送验证码")
                 return True
 
@@ -873,7 +1044,7 @@ class DamaiU2Automation:
         return False
 
     def input_verify_code(self, code: str) -> bool:
-        """输入短信验证码。
+        """输入短信验证码（拟人化逐字输入，比手机号稍快）。
 
         Args:
             code: 验证码
@@ -900,7 +1071,7 @@ class DamaiU2Automation:
             except Exception as e:
                 self._log(f"WebView 输入验证码失败：{e}")
 
-        # Native 方式
+        # Native 方式（拟人化逐字输入，验证码输入稍快）
         try:
             self.switch_to_native()
             # 查找验证码输入框（通常是第二个 EditText 或有特定 resourceId）
@@ -908,16 +1079,18 @@ class DamaiU2Automation:
                 resourceIdMatches=".*code.*|.*verify.*|.*sms.*"
             )
             if code_field.exists(timeout=3):
-                code_field.set_text(code)
-                self._log("已通过 Native 输入验证码")
+                human_type_text(self.d, code_field, code, interval=(0.03, 0.10),
+                                config=self._human_cfg)
+                self._log("已通过 Native 逐字输入验证码")
                 return True
 
             # 查找所有 EditText，取第二个（第一个是手机号）
             edit_fields = self.d(className="android.widget.EditText")
             count = edit_fields.count
             if count >= 2:
-                edit_fields[count - 1].set_text(code)
-                self._log("已通过第二个 EditText 输入验证码")
+                human_type_text(self.d, edit_fields[count - 1], code, interval=(0.03, 0.10),
+                                config=self._human_cfg)
+                self._log("已通过第二个 EditText 逐字输入验证码")
                 return True
 
         except Exception as e:
@@ -961,13 +1134,13 @@ class DamaiU2Automation:
             self.switch_to_native()
             login_btn = self.d(text="登录")
             if login_btn.exists(timeout=3):
-                login_btn.click()
+                human_click(login_btn, config=self._human_cfg)
                 self._log("已通过 Native 点击登录")
                 return True
 
             login_btn = self.d(textContains="登录")
             if login_btn.exists(timeout=3):
-                login_btn.click()
+                human_click(login_btn, config=self._human_cfg)
                 self._log("已通过 Native 点击登录")
                 return True
 
@@ -1016,12 +1189,12 @@ class DamaiU2Automation:
             except Exception:
                 pass
 
-            time.sleep(2)
+            human_delay(2.0, config=self._human_cfg)
 
         self._warn("登录超时")
         return False
 
-    # ── Cookie 提取 ──────────────────────────────────────────────────
+    # ── Cookie 提取 ────────────────────────────────────────────────── ──────────────────────────────────────────────────
     def get_cookies(self) -> List[Dict[str, Any]]:
         """从 WebView 提取 cookies。
 
@@ -1115,9 +1288,9 @@ class DamaiU2Automation:
             # 查找搜索框/搜索按钮
             search_entry = self.d(textContains="搜索")
             if search_entry.exists(timeout=3):
-                search_entry.click()
+                human_click(search_entry, config=self._human_cfg)
                 self._log("已点击搜索入口")
-                time.sleep(2)
+                human_delay(2.0, config=self._human_cfg)
                 return True
 
             # 查找搜索图标
@@ -1125,9 +1298,9 @@ class DamaiU2Automation:
                 resourceIdMatches=".*search.*|.*home_search.*"
             )
             if search_icon.exists(timeout=3):
-                search_icon.click()
+                human_click(search_icon, config=self._human_cfg)
                 self._log("已点击搜索图标")
-                time.sleep(2)
+                human_delay(2.0, config=self._human_cfg)
                 return True
 
         except Exception as e:
@@ -1136,7 +1309,7 @@ class DamaiU2Automation:
         # 策略 2：WebView 中打开搜索页
         if self.switch_to_webview():
             self.navigate_to_url(H5_SEARCH_URL)
-            time.sleep(3)
+            human_delay(3.0, config=self._human_cfg)
             return True
 
         return False
@@ -1176,7 +1349,7 @@ class DamaiU2Automation:
                 )
                 if ok:
                     self._log("已通过 WebView(JS) 输入搜索关键词")
-                    time.sleep(3)
+                    human_delay(3.0, config=self._human_cfg)
                     return True
             except Exception as e:
                 self._log(f"WebView 搜索失败：{e}")
@@ -1188,25 +1361,25 @@ class DamaiU2Automation:
                 resourceIdMatches=".*search.*input.*|.*query.*"
             )
             if search_field.exists(timeout=3):
-                search_field.set_text(keyword)
+                human_type_text(self.d, search_field, keyword, config=self._human_cfg)
                 # 点击搜索按钮
                 search_btn = self.d(textContains="搜索")
                 if search_btn.exists(timeout=2):
-                    search_btn.click()
+                    human_click(search_btn, config=self._human_cfg)
                 else:
                     # 按键盘回车
                     self.d.press("enter")
-                self._log("已通过 Native 输入搜索关键词")
-                time.sleep(3)
+                self._log("已通过 Native 逐字输入搜索关键词")
+                human_delay(3.0, config=self._human_cfg)
                 return True
 
             # 通用 EditText
             edit = self.d(className="android.widget.EditText")
             if edit.exists(timeout=3):
-                edit.set_text(keyword)
+                human_type_text(self.d, edit, keyword, config=self._human_cfg)
                 self.d.press("enter")
-                self._log("已通过 EditText 搜索")
-                time.sleep(3)
+                self._log("已通过 EditText 逐字搜索")
+                human_delay(3.0, config=self._human_cfg)
                 return True
 
         except Exception as e:
@@ -1612,8 +1785,8 @@ class DamaiU2Automation:
                 result["name"] = first_item.get_text() or ""
 
                 # 点击进入详情页获取 ID
-                first_item.click()
-                time.sleep(3)
+                human_click(first_item, config=self._human_cfg)
+                human_delay(3.0, config=self._human_cfg)
 
                 # 从当前 URL 获取 ID
                 current_url = self.get_current_url()
@@ -1745,7 +1918,7 @@ class DamaiU2Automation:
             print("❌ 无法输入手机号")
             return False
 
-        time.sleep(1)
+        human_delay(1.0, config=self._human_cfg)
 
         # Step 3: 点击发送验证码
         if not self.click_send_code():
@@ -1769,7 +1942,7 @@ class DamaiU2Automation:
                 print("❌ 无法输入验证码")
                 continue
 
-            time.sleep(1)
+            human_delay(1.0, config=self._human_cfg)
 
             if not self.click_login():
                 print("❌ 无法点击登录按钮")

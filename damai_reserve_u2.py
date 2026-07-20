@@ -36,15 +36,37 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from damai_u2 import DamaiU2Automation, DAMAI_PACKAGE
 
+from human_sim import (
+    dismiss_dialogs,
+    human_browse,
+    human_click,
+    human_delay,
+    human_idle_swipe,
+    human_navigate_pause,
+    human_scroll,
+    human_type_text,
+    retry_with_backoff,
+)
+
 try:
     from damai_ocr_click import OcrClickHelper
 except ImportError:
     OcrClickHelper = None  # type: ignore
 
+try:
+    from damai_intent import DamaiIntentHelper
+except ImportError:
+    DamaiIntentHelper = None  # type: ignore
+
+try:
+    from frida_damai_rpc import FridaDamaiRpc
+except ImportError:
+    FridaDamaiRpc = None  # type: ignore
+
 
 # ─── 常量 ────────────────────────────────────────────────────────────────
 
-DEFAULT_PHONE = "15757176315"
+DEFAULT_PHONE = ""  # 留空，必须通过 --phone 参数传入，避免硬编码手机号泄露
 DEFAULT_COOKIE_FILE = "damai_cookies_reserve.json"
 
 
@@ -71,20 +93,27 @@ class DamaiReserveAutomation(DamaiU2Automation):
         try:
             # 先回到 Native 层
             self.switch_to_native()
-            time.sleep(1)
+            human_delay(1.0, config=self._human_cfg)
+
+            # 拟人化：先关闭可能遮挡的弹窗（升级提示、广告等）
+            dismiss_dialogs(self.d, config=self._human_cfg)
 
             # 点击底部「我的」tab（多种匹配方式）
+            # 拟人化：连续 .exists() 间加微小延迟，避免快速 UI 树扫描特征
             my_tab = self.d(text="我的")
             if not my_tab.exists(timeout=3):
+                human_delay(0.15, config=self._human_cfg)
                 my_tab = self.d(textContains="我的")
             if not my_tab.exists(timeout=3):
+                human_delay(0.15, config=self._human_cfg)
                 my_tab = self.d(description="我的")
             if not my_tab.exists(timeout=3):
+                human_delay(0.15, config=self._human_cfg)
                 my_tab = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
             if my_tab.exists(timeout=3):
-                my_tab.click()
+                human_click(my_tab, config=self._human_cfg)
                 self._log("已点击「我的」tab")
-                time.sleep(2)
+                human_delay(2.0, config=self._human_cfg)
             else:
                 self._warn("未找到「我的」tab")
 
@@ -160,7 +189,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
                     # 检查是否已勾选
                     checked = checkbox.info.get("checked", False)
                     if not checked:
-                        checkbox.click()
+                        human_click(checkbox, config=self._human_cfg)
                         self._log("已勾选同意条款（Native CheckBox）")
                         print("✅ 已勾选同意条款")
                     else:
@@ -169,7 +198,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
                     return True
                 else:
                     # 没有 CheckBox 但有「同意」文字，尝试点击文字
-                    agree_text.click()
+                    human_click(agree_text, config=self._human_cfg)
                     self._log("已点击「同意」文字")
                     print("✅ 已点击同意条款")
                     return True
@@ -179,7 +208,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
             if checkbox.exists(timeout=2):
                 checked = checkbox.info.get("checked", False)
                 if not checked:
-                    checkbox.click()
+                    human_click(checkbox, config=self._human_cfg)
                     self._log("已勾选 CheckBox（Native）")
                     print("✅ 已勾选同意条款")
                 else:
@@ -276,19 +305,23 @@ class DamaiReserveAutomation(DamaiU2Automation):
             print("❌ 无法到达登录页面")
             return False
 
-        time.sleep(2)
+        human_navigate_pause(config=self._human_cfg)
 
         # Step 2: 勾选同意条款
+        # 拟人化：先看一眼页面再勾选
+        human_delay(0.7, config=self._human_cfg)
         self.agree_terms()
 
-        time.sleep(1)
+        human_delay(1.0, config=self._human_cfg)
 
         # Step 3: 输入手机号
+        # 拟人化：输入前先停顿一下（模拟看页面）
+        human_delay(0.8, config=self._human_cfg)
         if not self.input_phone(phone):
             print("❌ 无法输入手机号")
             return False
 
-        time.sleep(1)
+        human_delay(1.0, config=self._human_cfg)
 
         # Step 4: 点击发送验证码
         if not self.click_send_code():
@@ -297,9 +330,18 @@ class DamaiReserveAutomation(DamaiU2Automation):
 
         print("✅ 验证码已发送，请查收短信。")
 
+        # 拟人化：发送验证码后做随机行为（模拟用户切出去看短信）
+        print("  💡 提示：如出现滑块验证码，请在手机上手动完成验证后继续")
+        human_delay(2.0, config=self._human_cfg)
+        human_idle_swipe(self.d, config=self._human_cfg)
+
         # Step 5: 提示用户输入验证码
-        max_retries = 3
+        max_retries = 5
         for i in range(max_retries):
+            # 拟人化：等待输入期间做随机浏览（模拟切出 APP 看短信再回来）
+            if i > 0:
+                human_browse(self.d, duration=(1.0, 3.0), config=self._human_cfg)
+
             code = input(
                 f"\n🔑 请输入短信验证码（剩余 {max_retries - i} 次机会）: "
             ).strip()
@@ -312,7 +354,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
                 print("❌ 无法输入验证码")
                 continue
 
-            time.sleep(1)
+            human_delay(1.0, config=self._human_cfg)
 
             if not self.click_login():
                 print("❌ 无法点击登录按钮")
@@ -320,6 +362,9 @@ class DamaiReserveAutomation(DamaiU2Automation):
 
             # Step 7: 等待登录成功
             if self.wait_login_success():
+                # 拟人化：登录成功后额外等待（模拟用户看到登录成功的反应）
+                human_delay(2.0, config=self._human_cfg)
+                human_idle_swipe(self.d, config=self._human_cfg)
                 return True
 
             print("❌ 登录失败，验证码可能不正确。")
@@ -338,46 +383,54 @@ class DamaiReserveAutomation(DamaiU2Automation):
 
         try:
             self.switch_to_native()
-            time.sleep(1)
+            human_delay(1.0, config=self._human_cfg)
+
+            # 拟人化：先关闭可能遮挡的弹窗
+            dismiss_dialogs(self.d, config=self._human_cfg)
 
             # 确保在「我的」页面（多种匹配方式）
+            # 拟人化：连续 .exists() 间加微小延迟
             my_tab = self.d(text="我的")
             if not my_tab.exists(timeout=3):
+                human_delay(0.15, config=self._human_cfg)
                 my_tab = self.d(textContains="我的")
             if not my_tab.exists(timeout=3):
+                human_delay(0.15, config=self._human_cfg)
                 my_tab = self.d(description="我的")
             if not my_tab.exists(timeout=3):
+                human_delay(0.15, config=self._human_cfg)
                 my_tab = self.d(resourceIdMatches=".*tab.*mine.*|.*tab.*my.*|.*bottom.*my.*")
             if my_tab.exists(timeout=3):
-                my_tab.click()
+                human_click(my_tab, config=self._human_cfg)
                 self._log("已点击「我的」tab")
-                time.sleep(2)
+                # 拟人化：在「我的」页面先浏览一下再找入口
+                human_browse(self.d, duration=(2.0, 4.0), config=self._human_cfg)
 
             # 查找「抢票预约」入口
             # 策略 1：精确匹配
             reserve_entry = self.d(text="抢票预约")
             if reserve_entry.exists(timeout=5):
-                reserve_entry.click()
+                human_click(reserve_entry, config=self._human_cfg)
                 self._log("已点击「抢票预约」")
-                time.sleep(3)
+                human_navigate_pause(config=self._human_cfg)
                 print("✅ 已进入「抢票预约」页面")
                 return True
 
             # 策略 2：包含匹配
             reserve_entry = self.d(textContains="抢票预约")
             if reserve_entry.exists(timeout=3):
-                reserve_entry.click()
+                human_click(reserve_entry, config=self._human_cfg)
                 self._log("已点击「抢票预约」（包含匹配）")
-                time.sleep(3)
+                human_navigate_pause(config=self._human_cfg)
                 print("✅ 已进入「抢票预约」页面")
                 return True
 
             # 策略 3：更宽泛的匹配
             reserve_entry = self.d(textContains="预约")
             if reserve_entry.exists(timeout=3):
-                reserve_entry.click()
+                human_click(reserve_entry, config=self._human_cfg)
                 self._log("已点击含「预约」的入口")
-                time.sleep(3)
+                human_navigate_pause(config=self._human_cfg)
                 print("✅ 已进入预约相关页面")
                 return True
 
@@ -386,22 +439,22 @@ class DamaiReserveAutomation(DamaiU2Automation):
                 resourceIdMatches=".*reserve.*|.*booking.*|.*appointment.*|.*subscribe.*"
             )
             if reserve_entry.exists(timeout=3):
-                reserve_entry.click()
+                human_click(reserve_entry, config=self._human_cfg)
                 self._log("已点击预约入口（resourceId）")
-                time.sleep(3)
+                human_navigate_pause(config=self._human_cfg)
                 print("✅ 已进入预约相关页面")
                 return True
 
             # 策略 5：尝试滚动页面查找
             self._log("尝试滚动查找「抢票预约」…")
             for _ in range(5):
-                self.d.swipe(0.5, 0.8, 0.5, 0.2)
-                time.sleep(1)
+                human_scroll(self.d, direction="down", config=self._human_cfg)
+                human_delay(1.0, config=self._human_cfg)
                 reserve_entry = self.d(textContains="预约")
                 if reserve_entry.exists(timeout=2):
-                    reserve_entry.click()
+                    human_click(reserve_entry, config=self._human_cfg)
                     self._log("滚动后找到预约入口")
-                    time.sleep(3)
+                    human_navigate_pause(config=self._human_cfg)
                     print("✅ 已进入预约相关页面")
                     return True
 
@@ -429,7 +482,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
                 )
                 if ok:
                     self._log("WebView 点击预约入口成功")
-                    time.sleep(3)
+                    human_navigate_pause(config=self._human_cfg)
                     print("✅ 已进入预约相关页面")
                     return True
             except Exception as e:
@@ -456,7 +509,10 @@ class DamaiReserveAutomation(DamaiU2Automation):
         # ── Native 层 ──
         try:
             self.switch_to_native()
-            time.sleep(1)
+            human_delay(1.0, config=self._human_cfg)
+
+            # 拟人化：列表页加载后先浏览一下
+            human_browse(self.d, duration=(1.0, 3.0), config=self._human_cfg)
 
             # 查找第一个列表项（演出卡片）
             # 策略 1：通过 resourceId 查找
@@ -467,9 +523,11 @@ class DamaiReserveAutomation(DamaiU2Automation):
                 result["name"] = first_item.get_text() or ""
                 self._log(f"找到第一条预约演出（Native resourceId）：{result['name']}")
 
+                # 拟人化：点击前短暂停顿
+                human_delay(0.8, config=self._human_cfg)
                 # 点击进入详情
-                first_item.click()
-                time.sleep(3)
+                human_click(first_item, config=self._human_cfg)
+                human_navigate_pause(config=self._human_cfg)
                 return result if result.get("name") else result
 
             # 策略 2：通过 className 查找第一个可点击项
@@ -482,8 +540,9 @@ class DamaiReserveAutomation(DamaiU2Automation):
                     result["name"] = child_text.get_text() or ""
                     self._log(f"找到第一条预约演出（Native TextView）：{result['name']}")
 
-                first_item.click()
-                time.sleep(3)
+                human_delay(0.8, config=self._human_cfg)
+                human_click(first_item, config=self._human_cfg)
+                human_navigate_pause(config=self._human_cfg)
                 return result
 
             # 策略 3：直接查找所有 TextView，取第一个看起来像演出名的
@@ -500,8 +559,9 @@ class DamaiReserveAutomation(DamaiU2Automation):
                         if len(txt) > 4 and txt not in skip_texts:
                             result["name"] = txt
                             self._log(f"疑似演出名：{txt}")
-                            tv.click()
-                            time.sleep(3)
+                            human_delay(0.8, config=self._human_cfg)
+                            human_click(tv, config=self._human_cfg)
+                            human_navigate_pause(config=self._human_cfg)
                             return result
                     except Exception:
                         continue
@@ -561,7 +621,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
                     # 点击进入详情
                     if result.get("url"):
                         self.navigate_to_url(result["url"])
-                        time.sleep(3)
+                        human_navigate_pause(config=self._human_cfg)
                     else:
                         # 通过 JS 点击
                         self._wd.execute_script(
@@ -570,7 +630,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
                             if (el) { el.click(); }
                             """
                         )
-                        time.sleep(3)
+                        human_navigate_pause(config=self._human_cfg)
 
                     return result
 
@@ -592,36 +652,43 @@ class DamaiReserveAutomation(DamaiU2Automation):
         # ── Native 层 ──
         try:
             self.switch_to_native()
-            time.sleep(1)
+            human_delay(1.0, config=self._human_cfg)
+
+            # 拟人化：先关闭可能遮挡的弹窗
+            dismiss_dialogs(self.d, config=self._human_cfg)
 
             # 先尝试直接查找
             reserved_btn = self.d(textContains="已预约")
             if reserved_btn.exists(timeout=5):
-                reserved_btn.click()
+                # 拟人化：找到按钮后不立即点击，先短暂停顿
+                human_delay(0.5, config=self._human_cfg)
+                human_click(reserved_btn, config=self._human_cfg)
                 self._log("已点击「已预约」按钮")
-                time.sleep(2)
+                human_navigate_pause(config=self._human_cfg)
                 print("✅ 已点击「已预约」")
                 return True
 
             # 滚动到页面底部查找
             self._log("滚动到页面底部查找…")
             for _ in range(8):
-                self.d.swipe(0.5, 0.8, 0.5, 0.2)
-                time.sleep(0.5)
+                human_scroll(self.d, direction="down", config=self._human_cfg)
+                human_delay(0.5, config=self._human_cfg)
                 reserved_btn = self.d(textContains="已预约")
                 if reserved_btn.exists(timeout=2):
-                    reserved_btn.click()
+                    human_delay(0.5, config=self._human_cfg)
+                    human_click(reserved_btn, config=self._human_cfg)
                     self._log("滚动后找到并点击「已预约」")
-                    time.sleep(2)
+                    human_navigate_pause(config=self._human_cfg)
                     print("✅ 已点击「已预约」")
                     return True
 
             # 备用：查找含「预约」的按钮
             reserved_btn = self.d(textContains="预约")
             if reserved_btn.exists(timeout=3):
-                reserved_btn.click()
+                human_delay(0.5, config=self._human_cfg)
+                human_click(reserved_btn, config=self._human_cfg)
                 self._log("已点击含「预约」的按钮")
-                time.sleep(2)
+                human_navigate_pause(config=self._human_cfg)
                 print("✅ 已点击预约相关按钮")
                 return True
 
@@ -630,9 +697,10 @@ class DamaiReserveAutomation(DamaiU2Automation):
                 resourceIdMatches=".*reserve.*btn.*|.*booking.*btn.*|.*subscribe.*btn.*"
             )
             if reserved_btn.exists(timeout=3):
-                reserved_btn.click()
+                human_delay(0.5, config=self._human_cfg)
+                human_click(reserved_btn, config=self._human_cfg)
                 self._log("已点击预约按钮（resourceId）")
-                time.sleep(2)
+                human_navigate_pause(config=self._human_cfg)
                 print("✅ 已点击预约按钮")
                 return True
 
@@ -673,7 +741,7 @@ class DamaiReserveAutomation(DamaiU2Automation):
                 )
                 if ok:
                     self._log("WebView 点击「已预约」成功")
-                    time.sleep(2)
+                    human_navigate_pause(config=self._human_cfg)
                     print("✅ 已点击「已预约」")
                     return True
             except Exception as e:
@@ -686,9 +754,81 @@ class DamaiReserveAutomation(DamaiU2Automation):
         print("  3. 可能需要手动滚动到页面底部")
         return False
 
-    # ── OCR 降级：点击「已预约」按钮 ─────────────────────────────────
+    # ── OCR 优先：获取第一条已预约演出 ──────────────────────────────
+    def get_first_reserved_show_ocr(self) -> Optional[Dict[str, str]]:
+        """OCR 方式获取第一条已预约演出（优先方案，不依赖 UI 元素树）。
+
+        通过截图 → OCR 识别文字 → 找到第一个看起来像演出名的文字 → 点击坐标，
+        适用于自研渲染引擎/Flutter 等场景。
+
+        Returns:
+            dict with keys: name; or None
+        """
+        if OcrClickHelper is None:
+            self._warn("damai_ocr_click 模块不可用，无法使用 OCR 方案")
+            print("  安装方法：pip install Pillow paddleocr paddlepaddle")
+            return None
+
+        print("🎭 [OCR 优先] 正在通过截图+OCR 查找第一条已预约演出…")
+
+        try:
+            helper = OcrClickHelper(device=self.d, verbose=self.verbose)
+
+            # 先浏览一下页面
+            human_browse(self.d, duration=(1.0, 2.5), config=self._human_cfg)
+
+            # OCR 提取当前屏所有文字
+            all_texts = helper.extract_all_text()
+            if not all_texts:
+                self._log("OCR 未识别到任何文字")
+                return None
+
+            # 找第一个看起来像演出名的文字（长度>4，排除常见非演出文字）
+            skip_texts = {"抢票预约", "我的", "搜索", "首页", "更多", "返回", "设置",
+                          "登录", "注册", "消息", "推荐", "热门"}
+            for item in all_texts:
+                text = item.text if hasattr(item, 'text') else str(item)
+                if len(text) > 4 and text not in skip_texts:
+                    result = {"name": text}
+                    self._log(f"OCR 找到疑似演出名：{text}")
+
+                    # 点击该文字进入详情
+                    if hasattr(item, 'center_x') and hasattr(item, 'center_y'):
+                        human_delay(0.8, config=self._human_cfg)
+                        helper._tap(item.center_x, item.center_y)
+                        human_navigate_pause(config=self._human_cfg)
+                        return result
+                    else:
+                        # 降级：用 click_text 点击
+                        if helper.click_text(text):
+                            human_navigate_pause(config=self._human_cfg)
+                            return result
+
+            # 当前屏没找到，尝试滑动查找
+            self._log("当前屏未找到演出名，尝试滑动查找…")
+            for _ in range(5):
+                human_scroll(self.d, direction="down", config=self._human_cfg)
+                human_delay(1.0, config=self._human_cfg)
+                all_texts = helper.extract_all_text()
+                for item in all_texts:
+                    text = item.text if hasattr(item, 'text') else str(item)
+                    if len(text) > 4 and text not in skip_texts:
+                        result = {"name": text}
+                        self._log(f"OCR 滑动后找到疑似演出名：{text}")
+                        if hasattr(item, 'center_x') and hasattr(item, 'center_y'):
+                            human_delay(0.8, config=self._human_cfg)
+                            helper._tap(item.center_x, item.center_y)
+                            human_navigate_pause(config=self._human_cfg)
+                            return result
+
+        except Exception as e:
+            self._warn(f"OCR 获取预约演出失败：{e}")
+
+        return None
+
+    # ── OCR 优先：点击「已预约」按钮 ─────────────────────────────────
     def click_reserved_button_ocr(self) -> bool:
-        """OCR 方式点击底部「已预约」按钮（WebView/Native 失败时的降级方案）。
+        """OCR 方式点击底部「已预约」按钮（优先方案，不依赖 UI 元素树）。
 
         通过截图 → OCR 识别文字 → adb input tap 点击坐标，
         不依赖 UI 元素树，适用于自研渲染引擎/Flutter 等场景。
@@ -697,11 +837,11 @@ class DamaiReserveAutomation(DamaiU2Automation):
             是否成功点击
         """
         if OcrClickHelper is None:
-            self._warn("damai_ocr_click 模块不可用，无法使用 OCR 降级方案")
+            self._warn("damai_ocr_click 模块不可用，无法使用 OCR 方案")
             print("  安装方法：pip install Pillow paddleocr paddlepaddle")
             return False
 
-        print("📌 [OCR 降级] 正在通过截图+OCR 查找「已预约」按钮…")
+        print("📌 [OCR 优先] 正在通过截图+OCR 查找「已预约」按钮…")
 
         try:
             helper = OcrClickHelper(device=self.d, verbose=self.verbose)
@@ -710,9 +850,9 @@ class DamaiReserveAutomation(DamaiU2Automation):
             self._warn(f"OCR 点击「已预约」失败：{e}")
             return False
 
-    # ── OCR 降级：提取场次和票档信息 ─────────────────────────────────
+    # ── OCR 优先：提取场次和票档信息 ─────────────────────────────────
     def extract_sessions_and_tickets_ocr(self) -> Dict[str, Any]:
-        """OCR 方式提取场次和票档信息（WebView/Native 失败时的降级方案）。
+        """OCR 方式提取场次和票档信息（优先方案，不依赖 UI 元素树）。
 
         通过滚动页面 → 逐屏截图 OCR → 按关键词分类，
         不依赖 UI 元素树。
@@ -721,11 +861,11 @@ class DamaiReserveAutomation(DamaiU2Automation):
             dict with keys: sessions, tickets, raw_text
         """
         if OcrClickHelper is None:
-            self._warn("damai_ocr_click 模块不可用，无法使用 OCR 降级方案")
+            self._warn("damai_ocr_click 模块不可用，无法使用 OCR 方案")
             print("  安装方法：pip install Pillow paddleocr paddlepaddle")
             return {"sessions": [], "tickets": [], "raw_text": ""}
 
-        print("📊 [OCR 降级] 正在通过截图+OCR 提取场次和票档信息…")
+        print("📊 [OCR 优先] 正在通过截图+OCR 提取场次和票档信息…")
 
         try:
             helper = OcrClickHelper(device=self.d, verbose=self.verbose)
@@ -867,7 +1007,9 @@ class DamaiReserveAutomation(DamaiU2Automation):
         if not info["sessions"] and not info["tickets"]:
             try:
                 self.switch_to_native()
-                time.sleep(1)
+                human_delay(1.0, config=self._human_cfg)
+                # 拟人化：页面加载后先浏览一下
+                human_browse(self.d, duration=(2.0, 4.0), config=self._human_cfg)
 
                 # 获取当前页面的所有文本
                 all_text = []
@@ -1010,53 +1152,126 @@ def main() -> None:
         pass
 
     parser = argparse.ArgumentParser(
-        description="大麦网 H5 自动化：登录 → 抢票预约 → 查看场次票档（uiautomator2）",
+        description="大麦网 H5 自动化：登录 → 抢票预约 → 查看场次票档（uiautomator2，OCR 优先）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python damai_reserve_u2.py\n"
-            "  python damai_reserve_u2.py --phone 15757176315\n"
-            "  python damai_reserve_u2.py --device abc123\n"
+            "  python damai_reserve_u2.py --phone 15757176315              # OCR 优先模式（默认）\n"
+            "  python damai_reserve_u2.py --no-ocr --phone 15757176315     # Native/WebView 优先\n"
+            "  python damai_reserve_u2.py --device abc123 --phone 15757176315\n"
             "  python damai_reserve_u2.py --skip-login\n"
-            "  python damai_reserve_u2.py --verbose\n"
+            "  python damai_reserve_u2.py --stealth high --phone 15757176315\n"
+            "  python damai_reserve_u2.py --verbose --phone 15757176315\n"
+            "\n"
+            "策略说明:\n"
+            "  优先级链（有 root）：Frida RPC → ADB Intent → OCR → Native/WebView → 图像模板\n"
+            "  优先级链（无 root）：ADB Intent → OCR → Native/WebView → 图像模板\n"
+            "  默认自动检测 root，无 root 时跳过 Frida，优先使用 Intent → OCR\n"
+            "  --frida-rpc：Frida RPC 调内部方法，零 UI 交互（需 root + frida-server）\n"
+            "  --intent：ADB Intent 直调，跳过 UI 导航（无需 root）\n"
+            "  --no-ocr：反转 OCR/Native 优先级\n"
+            "  --no-root：跳过 root 检测，直接按无 root 模式运行\n"
+            "\n"
+            "设备要求:\n"
+            "  Frida RPC: 需要 root + frida-server（零 UI 交互，最难被检测）\n"
+            "  ADB Intent: 仅需 USB 调试（无需 root，跳过 UI 导航）\n"
+            "  OCR: 仅需 USB 调试 + adb screenshot（无需 root，不依赖 UI 元素树）\n"
+            "  Native/WebView: 仅需 USB 调试（无需 root，依赖 UI 元素树）\n"
             "\n"
             "设备准备:\n"
             "  1. 手机开启 USB 调试（设置 → 开发者选项 → USB 调试）\n"
             "  2. USB 连接电脑，运行 adb devices 确认设备可见\n"
             "  3. 安装依赖：pip install uiautomator2 requests websocket-client\n"
+            "  4. OCR 依赖：pip install Pillow paddleocr paddlepaddle\n"
         ),
     )
     parser.add_argument("--device", type=str, default=None,
                         help="设备序列号（默认自动检测）")
     parser.add_argument("--phone", type=str, default=None,
-                        help=f"手机号（默认 {DEFAULT_PHONE}）")
+                        help="手机号（必填，或运行时交互输入）")
     parser.add_argument("--cookie-file", type=str, default=DEFAULT_COOKIE_FILE,
                         help=f"Cookie 保存文件（默认 {DEFAULT_COOKIE_FILE}）")
     parser.add_argument("--skip-login", action="store_true",
                         help="跳过登录（使用已保存的 cookies）")
     parser.add_argument("--frida", action="store_true",
                         help="使用 Frida 注入开启 WebView 调试（需 root + frida-server）")
-    parser.add_argument("--ocr", action="store_true",
-                        help="优先使用 OCR+坐标点击方式（截图→OCR→tap），不依赖 UI 元素树")
-    parser.add_argument("--ocr-only", action="store_true",
-                        help="仅使用 OCR 方式，跳过 Native/WebView 尝试")
+    parser.add_argument("--frida-rpc", action="store_true",
+                        help="使用 Frida RPC 调 APP 内部方法（最高优先级，需 root + frida-server）")
+    parser.add_argument("--intent", action="store_true",
+                        help="使用 ADB Intent 直调跳转页面（跳过 UI 导航，减少操作痕迹）")
+    parser.add_argument("--no-ocr", action="store_true",
+                        help="禁用 OCR 优先方案，改用 Native/WebView 优先（OCR 作为降级）")
+    parser.add_argument("--no-root", action="store_true",
+                        help="声明设备无 root，跳过 root 检测，直接按无 root 模式运行（Intent → OCR → Native/WebView）")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="输出详细日志")
+    parser.add_argument("--stealth", type=str, default="medium",
+                        choices=["low", "medium", "high"],
+                        help="拟人化等级：low(仅延迟抖动) / medium(默认) / high(更多随机行为)")
     args = parser.parse_args()
 
     phone = args.phone or DEFAULT_PHONE
+    if not phone:
+        phone = input("📱 请输入手机号: ").strip()
+        if not phone:
+            print("❌ 手机号不能为空")
+            sys.exit(1)
     cookie_file = args.cookie_file
     verbose = args.verbose
+    stealth = args.stealth
+
+    # 确定策略标签（先占位，连接设备后再根据 root 状态更新）
+    strategy = "(待检测 root 后确定)"
 
     print("╔════════════════════════════════════════════════╗")
     print("║  大麦网 抢票预约自动化 (u2)                    ║")
     print("║  登录 → 抢票预约 → 场次票档                    ║")
+    print(f"║  拟人化等级: {stealth:<33}║")
     print("╚════════════════════════════════════════════════╝")
+    print()
+
+    # ── Step 0: 连接设备 ─────────────────────────────────────────────
+    automation = DamaiReserveAutomation(
+        device_serial=args.device,
+        verbose=verbose,
+        stealth_level=args.stealth,
+    )
+    automation.connect_device()
+
+    # ── Step 0.1: 检测 root 状态 ─────────────────────────────────────
+    if args.no_root:
+        has_root = False
+        print("🔓 --no-root 已指定，跳过 root 检测，按无 root 模式运行")
+    else:
+        has_root = automation.check_root()
+
+    # ── Step 0.2: 根据root状态 + 命令行开关确定策略 ──────────────────
+    if args.frida_rpc:
+        if has_root:
+            strategy = "Frida RPC → Intent → OCR → NW"
+        else:
+            print("⚠️ --frida-rpc 需要 root，但设备未 root，自动降级到 Intent → OCR → NW")
+            args.frida_rpc = False  # 自动降级
+            strategy = "Intent → OCR → Native/WebView"
+    elif args.intent:
+        strategy = "Intent → OCR → Native/WebView"
+    elif args.no_ocr:
+        strategy = "Native/WebView → OCR"
+    else:
+        if has_root:
+            strategy = "Frida RPC → Intent → OCR → NW"
+        else:
+            strategy = "Intent → OCR → Native/WebView → Template"
+
+    print(f"\n📋 策略: {strategy}")
+    print(f"   Root: {'✅ 已 root' if has_root else '❌ 未 root'}")
     print()
 
     # ── Step -1: Frida 注入（可选，开启 WebView 调试） ────────────────
     frida_hook = None
-    if args.frida:
+    if args.frida and not has_root:
+        print("⚠️ --frida 需要 root 权限，但设备未 root，跳过 Frida 注入")
+    elif args.frida:
         try:
             from frida_webview_debug import FridaWebViewDebugHook
             print("💉 正在通过 Frida 注入 WebView 调试 hook…")
@@ -1074,15 +1289,32 @@ def main() -> None:
             print(f"⚠️ Frida 注入失败：{e}")
             print("  将尝试继续，但 WebView 可能无法连接。")
 
-    # ── Step 0: 连接设备 ─────────────────────────────────────────────
-    automation = DamaiReserveAutomation(
-        device_serial=args.device,
-        verbose=verbose,
-    )
-    automation.connect_device()
+    # ── Step -0.5: Frida RPC 注入（可选，调 APP 内部方法） ──────────
+    frida_rpc = None
+    if args.frida_rpc and not has_root:
+        print("⚠️ Frida RPC 需要 root 权限，但设备未 root，跳过 Frida RPC")
+    elif args.frida_rpc:
+        if FridaDamaiRpc is None:
+            print("⚠️ frida_damai_rpc 模块不可用。pip install frida frida-tools")
+        else:
+            try:
+                print("💉 正在通过 Frida RPC 注入…")
+                frida_rpc = FridaDamaiRpc(verbose=verbose)
+                if not frida_rpc.attach(DAMAI_PACKAGE):
+                    print("⚠️ Frida RPC attach 失败，将降级到其他方案")
+                    frida_rpc = None
+                else:
+                    print("✅ Frida RPC 已注入，可调 APP 内部方法")
+            except Exception as e:
+                print(f"⚠️ Frida RPC 注入失败：{e}")
+                frida_rpc = None
 
     # ── Step 1: 启动 APP ─────────────────────────────────────────────
     automation.launch_damai_app()
+
+    # 拟人化：启动后到登录之间的间隔
+    human_delay(2.0, config=automation._human_cfg)
+    human_idle_swipe(automation.d, config=automation._human_cfg)
 
     # ── Step 2: 登录 ─────────────────────────────────────────────────
     if args.skip_login:
@@ -1115,20 +1347,79 @@ def main() -> None:
             # 登录成功，提取并保存 cookies
             cookies = automation.get_cookies()
             if cookies:
+                # 校验关键登录态 cookie 是否存在
+                login_cookie_names = {"cookie2", "sgcookie", "login2", "_m_h5_tk", "_m_h5_tk_enc"}
+                has_login_cookie = any(
+                    c.get("name") in login_cookie_names
+                    for c in cookies
+                )
+                if not has_login_cookie:
+                    print(f"⚠️ 已提取 {len(cookies)} 个 cookies，但未检测到关键登录态（cookie2/sgcookie/login2）")
+                    print("  保存可能不完整，下次 --skip-login 可能需要重新登录")
+                else:
+                    print(f"✅ 登录态 cookie 校验通过（{len(cookies)} 个 cookies）")
                 automation.save_cookies(cookie_file)
             else:
                 print("⚠️ 未能提取 cookies，将尝试继续…")
 
     # ── Step 3: 导航到抢票预约 ───────────────────────────────────────
     print()
-    if not automation.navigate_to_reserve():
-        print("\n❌ 无法进入「抢票预约」页面，无法继续。")
-        automation.cleanup()
-        sys.exit(1)
+    # 拟人化：登录后到导航之间的间隔
+    human_delay(1.5, config=automation._human_cfg)
+    human_idle_swipe(automation.d, config=automation._human_cfg)
+
+    reserve_ok = False
+
+    # 优先级 1：Frida RPC 导航（仅 root 设备且 frida_rpc 已注入时可用）
+    if frida_rpc and frida_rpc.is_attached:
+        print("🔗 [Frida RPC] 尝试通过内部方法导航到预约页…")
+        reserve_ok = frida_rpc.navigate_to("https://m.damai.cn/app/dmfe/h5-ultron-my/reserve.html")
+        if reserve_ok:
+            human_navigate_pause(config=automation._human_cfg)
+        else:
+            print("  Frida RPC 导航失败，降级到下一方案")
+            # 降级前做拟人化行为（掩盖失败尝试的痕迹，看起来像用户在页面上犹豫）
+            human_browse(automation.d, duration=(1.0, 3.0), config=automation._human_cfg)
+
+    # 优先级 2：ADB Intent 直调
+    if not reserve_ok and args.intent:
+        if DamaiIntentHelper is not None:
+            print("🔗 [Intent] 尝试通过 ADB Intent 打开预约页…")
+            try:
+                intent_helper = DamaiIntentHelper(device=automation.d, verbose=verbose)
+                reserve_ok = intent_helper.open_reserve_list()
+                if reserve_ok:
+                    human_navigate_pause(config=automation._human_cfg)
+                else:
+                    print("  Intent 导航失败，降级到下一方案")
+                    # 降级前做拟人化行为
+                    human_browse(automation.d, duration=(1.5, 3.5), config=automation._human_cfg)
+            except Exception as e:
+                print(f"  Intent 导航异常：{e}")
+
+    # 优先级 3：UI 导航（OCR/Native/WebView）
+    if not reserve_ok:
+        if not automation.navigate_to_reserve():
+            print("\n❌ 无法进入「抢票预约」页面，无法继续。")
+            automation.cleanup()
+            sys.exit(1)
 
     # ── Step 4: 找到第一条已预约演出 ─────────────────────────────────
     print()
-    first_show = automation.get_first_reserved_show()
+    # 拟人化：进入预约页后先浏览一下
+    human_delay(1.0, config=automation._human_cfg)
+    if args.no_ocr:
+        # Native/WebView 优先，OCR 降级
+        first_show = automation.get_first_reserved_show()
+        if not first_show:
+            print("\n⚠️ Native/WebView 未找到预约演出，尝试 OCR 方案…")
+            first_show = automation.get_first_reserved_show_ocr()
+    else:
+        # OCR 优先（默认），Native/WebView 降级
+        first_show = automation.get_first_reserved_show_ocr()
+        if not first_show:
+            print("\n⚠️ OCR 未找到预约演出，尝试 Native/WebView 方案…")
+            first_show = automation.get_first_reserved_show()
     if not first_show:
         print("\n❌ 未找到已预约的演出。")
         print("提示：")
@@ -1147,42 +1438,53 @@ def main() -> None:
 
     # ── Step 5: 点击「已预约」查看场次和票档 ─────────────────────────
     print()
+    # 拟人化：查看演出详情后到点击预约之间的间隔
+    human_delay(1.0, config=automation._human_cfg)
+    human_idle_swipe(automation.d, config=automation._human_cfg)
     clicked = False
 
-    if args.ocr_only:
-        # 仅 OCR 模式
-        clicked = automation.click_reserved_button_ocr()
-    elif args.ocr:
-        # OCR 优先模式
-        clicked = automation.click_reserved_button_ocr()
-        if not clicked:
-            print("  OCR 未找到，尝试 Native/WebView 方式…")
-            clicked = automation.click_reserved_button()
-    else:
-        # 默认：Native/WebView 优先，失败降级 OCR
+    if args.no_ocr:
+        # Native/WebView 优先，OCR 降级
         clicked = automation.click_reserved_button()
         if not clicked:
-            print("\n⚠️ Native/WebView 方式未找到「已预约」按钮，尝试 OCR 降级方案…")
+            print("\n⚠️ Native/WebView 方式未找到「已预约」按钮，尝试 OCR 方案…")
             clicked = automation.click_reserved_button_ocr()
+    else:
+        # OCR 优先（默认），Native/WebView 降级
+        clicked = automation.click_reserved_button_ocr()
+        if not clicked:
+            print("\n⚠️ OCR 方式未找到「已预约」按钮，尝试 Native/WebView 方案…")
+            clicked = automation.click_reserved_button()
 
     if not clicked:
         print("\n❌ 无法点击「已预约」按钮。")
         print("将尝试提取当前页面信息…")
 
     # 提取场次和票档信息
-    time.sleep(2)  # 等待页面加载
-    info = automation.extract_sessions_and_tickets()
+    human_delay(2.0, config=automation._human_cfg)  # 等待页面加载
 
-    # 如果结构化信息为空，尝试 OCR 降级提取
-    if not info.get("sessions") and not info.get("tickets"):
-        print("\n⚠️ Native/WebView 提取为空，尝试 OCR 降级提取…")
-        ocr_info = automation.extract_sessions_and_tickets_ocr()
-        if ocr_info.get("sessions") or ocr_info.get("tickets"):
-            info = ocr_info
-        elif ocr_info.get("raw_text"):
-            # OCR 提取到了原始文本但没有分类成功，合并 raw_text
-            if not info.get("raw_text"):
-                info["raw_text"] = ocr_info["raw_text"]
+    if args.no_ocr:
+        # Native/WebView 优先，OCR 降级
+        info = automation.extract_sessions_and_tickets()
+        if not info.get("sessions") and not info.get("tickets"):
+            print("\n⚠️ Native/WebView 提取为空，尝试 OCR 方案…")
+            ocr_info = automation.extract_sessions_and_tickets_ocr()
+            if ocr_info.get("sessions") or ocr_info.get("tickets"):
+                info = ocr_info
+            elif ocr_info.get("raw_text"):
+                if not info.get("raw_text"):
+                    info["raw_text"] = ocr_info["raw_text"]
+    else:
+        # OCR 优先（默认），Native/WebView 降级
+        info = automation.extract_sessions_and_tickets_ocr()
+        if not info.get("sessions") and not info.get("tickets"):
+            print("\n⚠️ OCR 提取为空，尝试 Native/WebView 方案…")
+            nw_info = automation.extract_sessions_and_tickets()
+            if nw_info.get("sessions") or nw_info.get("tickets"):
+                info = nw_info
+            elif nw_info.get("raw_text"):
+                if not info.get("raw_text"):
+                    info["raw_text"] = nw_info["raw_text"]
 
     # 输出结果
     print()
@@ -1190,6 +1492,9 @@ def main() -> None:
 
     # ── 清理 ─────────────────────────────────────────────────────────
     automation.cleanup()
+    if frida_rpc and frida_rpc.is_attached:
+        frida_rpc.detach()
+        print("✅ Frida RPC 已断开")
     if frida_hook and frida_hook.is_attached():
         frida_hook.detach()
         print("✅ Frida hook 已断开")

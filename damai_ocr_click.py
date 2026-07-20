@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import os
+import random
 import re
 import sys
 import time
@@ -417,14 +418,28 @@ class OcrClickHelper:
     # ── 点击 ──────────────────────────────────────────────────────────
 
     def _tap(self, x: int, y: int) -> None:
-        """通过 adb input tap 点击指定坐标。
+        """通过 adb input tap 点击指定坐标（带拟人化抖动）。
+
+        风控系统可通过 /proc/input/event 事件流检测到：
+          - 每次点击坐标都是整数（真人会有亚像素抖动）
+          - 点击位置总是精确命中 OCR 文字中心（真人会偏移 5-20px）
+        此方法加入坐标偏移和前后延迟来模拟真人点击。
 
         Args:
             x: X 坐标
             y: Y 坐标
         """
-        self.d.shell(f"input tap {x} {y}")
-        self._log(f"已点击坐标 ({x}, {y})")
+        # 拟人化：坐标偏移 ±5~15px（真人不会精确点击中心）
+        offset_x = random.randint(-12, 12)
+        offset_y = random.randint(-12, 12)
+        tap_x = x + offset_x
+        tap_y = y + offset_y
+        # 拟人化：点击前短暂停顿（模拟手指移动时间）
+        time.sleep(random.uniform(0.05, 0.15))
+        self.d.shell(f"input tap {tap_x} {tap_y}")
+        # 拟人化：点击后短暂停顿
+        time.sleep(random.uniform(0.08, 0.20))
+        self._log(f"已点击坐标 ({tap_x}, {tap_y})，原始 ({x}, {y})")
 
     def click_text(
         self,
@@ -695,6 +710,124 @@ class OcrClickHelper:
             f"{len(sessions)} 个场次，{len(tickets)} 个票档"
         )
         return result
+
+    # ── 图像模板匹配 ──────────────────────────────────────────────────
+
+    def click_by_template(
+        self,
+        template_name: str,
+        threshold: float = 0.7,
+        scroll: bool = False,
+        max_swipes: int = 5,
+    ) -> bool:
+        """通过图像模板匹配查找并点击按钮/图标。
+
+        补充 OCR 对纯图标按钮（返回箭头、关闭×、底部 tab 图标等）的盲区。
+        使用 OpenCV matchTemplate 在当前屏幕截图中匹配预存模板。
+
+        Args:
+            template_name: 模板名称（不含路径和扩展名），如 "btn_reserved"
+                           对应 templates/btn_reserved.png
+            threshold: 匹配置信度阈值（0~1），越高越严格
+            scroll: 未找到时是否自动滑动查找
+            max_swipes: 最大滑动次数
+
+        Returns:
+            是否成功找到并点击
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            print("⚠️ 缺少 OpenCV 依赖，无法使用模板匹配。pip install opencv-python")
+            return False
+
+        if Image is None:
+            print("⚠️ 缺少 Pillow 依赖")
+            return False
+
+        # 查找模板文件
+        template_dir = os.path.join(os.path.dirname(__file__), "templates")
+        template_path = os.path.join(template_dir, f"{template_name}.png")
+
+        if not os.path.isfile(template_path):
+            # 尝试其他扩展名
+            for ext in [".jpg", ".jpeg", ".bmp"]:
+                alt_path = os.path.join(template_dir, f"{template_name}{ext}")
+                if os.path.isfile(alt_path):
+                    template_path = alt_path
+                    break
+            else:
+                print(f"⚠️ 模板文件不存在：{template_path}")
+                return False
+
+        # 读取模板
+        template_cv = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        if template_cv is None:
+            print(f"⚠️ 无法读取模板图片：{template_path}")
+            return False
+
+        th, tw = template_cv.shape[:2]
+        print(f"🔍 模板匹配「{template_name}」({tw}x{th})…")
+
+        # 截取当前屏幕
+        img = self.screenshot()
+        # PIL → OpenCV 格式
+        screen_np = np.array(img)
+        screen_cv = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
+        sh, sw = screen_cv.shape[:2]
+
+        # 如果模板比屏幕大，自动缩放模板
+        if tw > sw or th > sh:
+            scale = min(sw * 0.8 / tw, sh * 0.8 / th)
+            new_w, new_h = int(tw * scale), int(th * scale)
+            template_cv = cv2.resize(template_cv, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            th, tw = template_cv.shape[:2]
+
+        # 模板匹配
+        result = cv2.matchTemplate(screen_cv, template_cv, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+        if max_val >= threshold:
+            # 计算匹配区域的中心坐标
+            match_x = max_loc[0] + tw // 2
+            match_y = max_loc[1] + th // 2
+            print(f"✅ 模板匹配成功（置信度={max_val:.3f}，坐标=({match_x}, {match_y})）")
+            self._tap(match_x, match_y)
+            return True
+
+        # 当前屏未找到，尝试滑动
+        if scroll:
+            print(f"  当前屏未找到，开始滑动查找…")
+            for i in range(max_swipes):
+                self._swipe_up()
+                time.sleep(1)
+
+                # 重新截图
+                img = self.screenshot()
+                screen_np = np.array(img)
+                screen_cv = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
+
+                result = cv2.matchTemplate(screen_cv, template_cv, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+                if max_val >= threshold:
+                    match_x = max_loc[0] + tw // 2
+                    match_y = max_loc[1] + th // 2
+                    print(f"✅ 滑动后模板匹配成功（第{i+1}次，置信度={max_val:.3f}）")
+                    self._tap(match_x, match_y)
+                    return True
+
+        print(f"⚠️ 模板匹配未找到「{template_name}」（最高置信度={max_val:.3f}）")
+        return False
+
+    def _swipe_up(self) -> None:
+        """向上滑动（查看下方内容）。"""
+        w, h = self._get_screen_size()
+        swipe_x = int(w * 0.5)
+        y_start = int(h * 0.7)
+        y_end = int(h * 0.3)
+        self._device.swipe(swipe_x, y_start, swipe_x, y_end, duration=0.5)
 
     # ── 便捷方法 ──────────────────────────────────────────────────────
 
